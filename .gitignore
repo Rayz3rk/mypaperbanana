@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Bundled Python runtime (auto-downloaded on first run)
+runtime/
+
+# Project specific
+configs/model_config.yaml*
+configs/connections.local.yaml*
+*.local.*
+.streamlit/secrets.toml
+credentials*.json
+token*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+data/
+results/
+docs/implementation-*.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+!.env.template
+*.log
+*.bak
+*.backup

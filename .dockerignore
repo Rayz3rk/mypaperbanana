@@ -1,0 +1,23 @@
+# Mount credentials and local settings at runtime.
+configs/model_config.yaml
+configs/connections.local.yaml*
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.git
+.venv
+venv
+runtime
+data
+results
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.log
+.DS_Store
+Thumbs.db

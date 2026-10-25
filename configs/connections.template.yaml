@@ -1,0 +1,15 @@
+# Copy to connections.local.yaml or save from the UI. Never commit real API keys.
+# The original model_config.yaml is still supported and is never rewritten.
+connections:
+  text:
+    provider: newapi
+    base_url: https://newapi.omgteam.me/v1
+    api_key: ""
+    model: "" # Choose a vision-capable text model from your account's model list.
+    image_api: images
+  image:
+    provider: newapi # May be different from the text provider.
+    base_url: https://newapi.omgteam.me/v1
+    api_key: "" # An independent key; never implicitly reuses the text key.
+    model: "" # Choose an image model available to this key.
+    image_api: images # images / chat / gemini / evolink
