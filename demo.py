@@ -36,7 +36,8 @@ JOB_STATUSES = {"queued": "等待中", "running": "生成中", "completed": "已
 
 def _stage_label(stage):
     labels = {"retriever": "检索参考", "retriever_cached": "复用参考", "planner": "规划",
-              "stylist": "风格优化", "visualizer": "生成初图", "polish": "精修",
+              "stylist": "风格优化", "stylist_fallback": "风格优化未完成，使用原规划",
+              "visualizer": "生成初图", "polish": "精修",
               "code_ready": "绘图代码就绪", "completed": "已完成", "failed": "失败"}
     if stage.endswith("_completed"):
         return _stage_label(stage.removesuffix("_completed")) + "完成"
@@ -156,6 +157,8 @@ def display_candidate_result(result, candidate_id, exp_mode, widget_prefix=None)
     st.markdown(f"**候选 {candidate_id + 1}**")
     if result.get("status") == "failed":
         st.error(result.get("error", "此候选失败，可单独重试。"))
+    if isinstance(result.get("stylist_warning"), str):
+        st.warning(result["stylist_warning"])
     key = final_image_key(result, exp_mode)
     if key:
         image = base64_to_image(result[key])

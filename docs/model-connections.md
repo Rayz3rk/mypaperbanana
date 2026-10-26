@@ -105,6 +105,14 @@ python main.py --input-file input.json --num-candidates 3 --max-concurrent 2 --m
 
 统计图需要 `--task_name plot --allow-plot-code-execution`。关闭评审时使用 `--max_critic_rounds 0`；关闭参考库使用 `--retrieval_setting none`。
 
+## 风格优化失败时
+
+stylist 是风格优化阶段。文本请求遇到断线、超时、非 JSON 响应或空正文时，会在原有次数上限内重试；重试也计入文本请求数。已达到输出上限的响应不会原样重复请求，模型的思考内容不会被当成绘图描述。
+
+风格优化重试后仍遇到临时故障，或收到输入/输出长度限制时，应用会保留有效规划，沿用原规划生成图片并继续评审，同时在该候选显示“未应用风格优化”的提示。此回退不会额外生成规划中间图。认证、权限、模型参数和安全规则错误仍会停止候选；没有有效规划也不会发起生图。
+
+错误提示和本地记录会区分 `timeout`、`connection`、`empty_text`、`output_limit` 等类别，并保留可用的 HTTP 状态码，不保存服务商原始错误正文。如果提示“达到输出上限”，可提高界面的单次文本输出上限，或改用生成正文更直接的文本模型。旧任务只记录异常类型，无法从旧记录还原更详细原因；新提示适用于修复后的新任务。
+
 ## Docker
 
 `.dockerignore` 排除 `model_config.yaml`、`connections.local.yaml`、`.env`、`.venv`、`data`、`results` 等本地文件。镜像使用非 root 用户。模型配置在运行时提供，不在构建时复制。

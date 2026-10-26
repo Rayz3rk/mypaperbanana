@@ -13,7 +13,7 @@ from utils.model_session import call_image_async, call_text_async, model_session
 
 
 @pytest_asyncio.fixture
-async def gateway():
+async def gateway(request):
     stream = BytesIO()
     Image.new("RGBA", (32, 18), (0, 90, 180, 180)).save(stream, format="PNG")
     encoded = base64.b64encode(stream.getvalue()).decode("ascii")
@@ -22,6 +22,11 @@ async def gateway():
         payload = await request.json()
         calls.append(("text", request.headers.get("Authorization"), payload))
         prompt = str(payload["messages"])
+        if getattr(request_info, "param", {}).get("empty_first") and len(calls) == 1:
+            return web.json_response({"choices": [{"message": {"content": None}}], "usage": {"total_tokens": 7}})
+        if getattr(request_info, "param", {}).get("style_output_limit") and "Style Guidelines:" in prompt:
+            return web.json_response({"choices": [{"finish_reason": "length", "message": {"content": None, "reasoning_content": "not a figure description"}}],
+                                      "usage": {"prompt_tokens": 100, "completion_tokens": 8192, "total_tokens": 8292}})
         if "critic_suggestions" in prompt:
             content = '{"critic_suggestions":"Make labels larger", "revised_description":"Revised readable encoder diagram"}'
         else:
@@ -48,6 +53,7 @@ async def gateway():
                 fields[part.name] = await part.text()
         calls.append(("edit", request.headers.get("Authorization"), fields))
         return web.json_response({"data": [{"b64_json": encoded}]})
+    request_info = request
     app = web.Application()
     app.router.add_post("/text/v1/chat/completions", text)
     app.router.add_post("/image/v1/images/generations", image)
@@ -62,6 +68,36 @@ async def gateway():
         yield f"http://127.0.0.1:{port}", calls
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway", [{"empty_first": True}], indirect=True)
+async def test_empty_text_retries_over_http_and_ui_usage_counts_both_requests(gateway):
+    base, calls = gateway
+    connection = ModelConnection(provider="newapi", base_url=base+"/text/v1", api_key="text-key", model="text-model")
+    async with model_session(connection, connection) as session:
+        assert await call_text_async("text-model", [{"type": "text", "text": "plan"}], {}, retry_delay=0)
+        assert session.usage()["text_requests"] == 2
+        assert session.usage()["total_tokens"] == 37
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway", [{"style_output_limit": True}], indirect=True)
+async def test_full_pipeline_recovers_from_style_output_limit_over_real_http(gateway):
+    from demo import process_parallel_candidates
+    base, calls = gateway
+    text = ModelConnection(provider="newapi", base_url=base+"/text/v1", api_key="text-key", model="thinking-text")
+    image = ModelConnection(provider="newapi", base_url=base+"/image/v1", api_key="image-key", model="test-image")
+    inputs = [{"candidate_id": index, "content": "An encoder with a decoder", "visual_intent": "Model architecture", "max_critic_rounds": 1} for index in range(2)]
+    results = await process_parallel_candidates(inputs, exp_mode="demo_full", retrieval_setting="none",
+        text_connection=text, image_connection=image, keep_intermediate_images=True, max_image_calls=4)
+    assert len(results) == 2 and all(r["status"] == "completed" for r in results)
+    assert all(r["stylist_status"] == "fallback" and r["stylist_error_code"] == "output_limit" for r in results)
+    assert all(r["eval_image_field"] == "target_diagram_critic_desc0_base64_jpg" for r in results)
+    assert len([c for c in calls if c[0] == "image"]) == 4
+    assert all(c[1] == "Bearer image-key" for c in calls if c[0] == "image")
+    assert all("not a figure description" not in str(c[2]) for c in calls if c[0] == "image")
 
 
 @pytest.mark.asyncio

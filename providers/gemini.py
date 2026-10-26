@@ -1,6 +1,5 @@
 """Google Gemini native REST adapter with a task-local HTTP session."""
 
-import asyncio
 import base64
 from typing import Any
 from urllib.parse import quote
@@ -67,22 +66,25 @@ class GeminiProvider(OpenAICompatibleProvider):
                                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_output_tokens}}
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
-        for attempt in range(max(1, max_attempts)):
-            self.usage["text_requests"] += 1
-            try:
-                body = await self._request_json("POST", f"models/{quote(model, safe='')}:generateContent", payload=payload)
-                break
-            except ProviderRequestError as exc:
-                if exc.status not in {429, 500, 502, 503, 504} or attempt + 1 >= max_attempts:
-                    raise
-                await asyncio.sleep(min(retry_delay * 2**attempt, 30))
-        self._record_tokens(body)
+        return await self._generate_text_with_retries(
+            f"models/{quote(model, safe='')}:generateContent", payload, max_attempts, retry_delay)
+
+    def _text_from_response(self, body: dict[str, Any]) -> str:
         candidates = body.get("candidates") or []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        candidate = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
+        feedback = body.get("promptFeedback") or {}
+        if (isinstance(feedback, dict) and feedback.get("blockReason")) or candidate.get("finishReason") in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION"}:
+            raise ProviderRequestError("Gemini 安全规则阻止了响应。", code="content_filter")
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            raise ProviderRequestError("Gemini 文本输出达到上限。", code="output_limit")
+        content = candidate.get("content") or {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        if not isinstance(parts, list):
+            raise ProviderRequestError("Gemini 响应结构无效。", code="invalid_response")
         text = "\n".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("thought"))
         if not text.strip() or text.strip() == "Error":
-            raise ProviderRequestError("Gemini 没有返回有效文本，可能被安全规则阻止或模型不支持此请求。")
-        return [text]
+            raise ProviderRequestError("Gemini 没有返回有效文本。", code="empty_text")
+        return text
 
     async def generate_image(self, model_name: str, prompt: str, aspect_ratio: str = "16:9", quality: str = "2K",
                              image_urls: list[str] | None = None, max_attempts: int = 1, retry_delay: float = 1,

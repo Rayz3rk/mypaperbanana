@@ -13,6 +13,7 @@ from agents.critic_agent import CriticAgent
 from agents.planner_agent import PlannerAgent
 from agents.retriever_agent import RetrieverAgent
 from agents.visualizer_agent import VisualizerAgent
+from providers.openai_compatible import ProviderRequestError
 from utils import generation_utils
 from utils.config import ExpConfig
 from utils.output_options import image_media_type, render_plot
@@ -36,6 +37,80 @@ def processor(cfg, **agents):
                              "critic_agent", "retriever_agent", "polish_agent")}
     defaults.update(agents)
     return PaperVizProcessor(cfg, **defaults)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task", ["diagram", "plot"])
+@pytest.mark.parametrize("error", [
+    ProviderRequestError("private server body", code="timeout"),
+    ProviderRequestError("private server body", code="empty_text"),
+    ProviderRequestError("private server body", code="output_limit"),
+    ProviderRequestError("private server body", status=503),
+])
+async def test_stylist_failure_preserves_plan_and_continues_critic_without_extra_images(tmp_path, task, error):
+    cfg = config(tmp_path, "demo_full", task=task, keep_intermediate_images=True, max_critic_rounds=1)
+    plan = "A complete scientifically accurate plan with labels and connections."
+    async def planning(data):
+        data[f"target_{task}_desc0"] = plan
+        return data
+    async def draw(data):
+        assert f"target_{task}_stylist_desc0" not in data
+        data[f"target_{task}_desc0_base64_jpg"] = png()
+        return data
+    async def critique(data, source):
+        assert source == "planner"
+        data[f"target_{task}_critic_suggestions0"] = "No changes needed."
+        return data
+    drawing = AsyncMock(side_effect=draw)
+    proc = processor(cfg, planner_agent=SimpleNamespace(process=planning),
+                     stylist_agent=SimpleNamespace(process=AsyncMock(side_effect=error)),
+                     visualizer_agent=SimpleNamespace(process=drawing), critic_agent=SimpleNamespace(process=critique))
+    result = [r async for r in proc.process_queries_batch([{"content": "paper", "visual_intent": "caption"}], do_eval=False)][0]
+    assert result["status"] == "completed"
+    assert result["stylist_status"] == "fallback" and result[f"target_{task}_desc0"] == plan
+    assert "未应用风格优化" in result["stylist_warning"] and "private" not in str(result)
+    assert result["eval_image_field"] == f"target_{task}_desc0_base64_jpg"
+    assert drawing.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    ProviderRequestError("private secret", status=401),
+    ProviderRequestError("private secret", status=403),
+    ProviderRequestError("private secret", status=400),
+    ProviderRequestError("private secret", code="content_filter"),
+])
+async def test_stylist_auth_configuration_and_safety_errors_stop_before_image(tmp_path, error):
+    cfg = config(tmp_path, "demo_full")
+    async def planning(data):
+        data["target_diagram_desc0"] = "valid plan"
+        return data
+    drawing = AsyncMock()
+    proc = processor(cfg, planner_agent=SimpleNamespace(process=planning),
+                     stylist_agent=SimpleNamespace(process=AsyncMock(side_effect=error)),
+                     visualizer_agent=SimpleNamespace(process=drawing))
+    result = [r async for r in proc.process_queries_batch([{}], do_eval=False)][0]
+    assert result["status"] == "failed" and result["failed_stage"] == "stylist"
+    assert result["error_code"] == error.code and "private" not in str(result)
+    drawing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stylist_fallback_never_draws_from_invalid_plan(tmp_path):
+    proc = processor(config(tmp_path, "demo_full"),
+        stylist_agent=SimpleNamespace(process=AsyncMock(side_effect=ProviderRequestError("timeout", code="timeout"))))
+    result = [r async for r in proc.process_queries_batch([{"target_diagram_desc0": "Error"}], do_eval=False)][0]
+    assert result["status"] == "failed"
+    proc.visualizer_agent.process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stylist_cancellation_does_not_trigger_fallback(tmp_path):
+    proc = processor(config(tmp_path, "demo_full"),
+        stylist_agent=SimpleNamespace(process=AsyncMock(side_effect=asyncio.CancelledError)))
+    with pytest.raises(asyncio.CancelledError):
+        await proc.process_single_query({"target_diagram_desc0": "valid plan"}, do_eval=False)
+    proc.visualizer_agent.process.assert_not_awaited()
 
 
 @pytest.mark.asyncio

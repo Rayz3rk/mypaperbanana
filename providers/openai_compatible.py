@@ -18,10 +18,47 @@ from .connections import ModelConnection, normalize_base_url
 
 
 class ProviderRequestError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, stage: str = "request"):
+    def __init__(self, message: str, *, status: int | None = None, stage: str = "request", code: str = "unknown"):
         super().__init__(message)
         self.status = status
         self.stage = stage
+        # Only these categories may reach UI/history; never forward upstream text.
+        self.code = code if code in {
+            "timeout", "connection", "non_json", "invalid_response", "empty_text",
+            "output_limit", "input_limit", "content_filter", "api_error", "http_error",
+        } else "unknown"
+
+    @property
+    def retryable(self) -> bool:
+        return (self.code not in {"content_filter", "input_limit", "output_limit"}
+                and (self.status in {408, 429, 500, 502, 503, 504}
+                     or (self.status is None and self.code in {
+                         "timeout", "connection", "non_json", "invalid_response", "empty_text"})))
+
+    @property
+    def safe_hint(self) -> str:
+        if self.stage == "download":
+            return "图片下载失败，生成任务不会自动重新提交；请从服务商任务记录恢复图片"
+        if self.code == "input_limit":
+            return "输入超过模型上下文上限"
+        if self.status is not None:
+            hint = {400: "请求参数或上下文不被模型接受", 401: "密钥无效或未授权",
+                    402: "服务商余额或额度不足", 403: "该密钥没有访问权限",
+                    404: "模型或接口路径不存在", 408: "服务商请求超时",
+                    429: "服务商限流或额度不足"}.get(self.status, "服务商请求失败")
+            return f"{hint}（HTTP {self.status}）"
+        return {"timeout": "连接或读取响应超时", "connection": "网络连接中断",
+                "non_json": "服务商返回非 JSON 响应", "invalid_response": "服务商响应结构无效",
+                "empty_text": "模型未返回可用正文", "output_limit": "模型达到输出上限，正文可能未生成或不完整；请提高文本输出上限或改用非思考模型",
+                "input_limit": "输入超过模型上下文上限", "content_filter": "模型安全规则阻止了响应",
+                "api_error": "服务商返回错误响应"}.get(self.code, "服务商返回未分类错误")
+
+
+def _api_error_code(body: dict[str, Any]) -> str:
+    error = body.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return {"context_length_exceeded": "input_limit", "content_policy_violation": "content_filter",
+            "content_filter": "content_filter"}.get(code, "api_error") if isinstance(code, str) else "api_error"
 
 
 def decode_data_url(value: str) -> tuple[bytes, str]:
@@ -99,17 +136,24 @@ class OpenAICompatibleProvider(BaseProvider):
         try:
             async with session.request(method, url, **kwargs) as response:
                 if response.status >= 400:
-                    raise ProviderRequestError(f"API 请求失败（HTTP {response.status}），请检查此连接的模型、密钥、额度和接口协议。", status=response.status)
+                    try:
+                        error_body = await response.json(content_type=None)
+                    except (ValueError, aiohttp.ClientError):
+                        error_body = {}
+                    code = _api_error_code(error_body) if isinstance(error_body, dict) else "http_error"
+                    raise ProviderRequestError(f"API 请求失败（HTTP {response.status}）。", status=response.status, code=code)
                 try:
                     body = await response.json(content_type=None)
                 except (ValueError, aiohttp.ContentTypeError) as exc:
-                    raise ProviderRequestError("API 返回了非 JSON 数据，请检查 Base URL 和接口协议。") from exc
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise ProviderRequestError("API 连接中断或超时。生成请求可能已被服务端接收，请先检查服务商任务记录再重试。") from exc
+                    raise ProviderRequestError("API 返回了非 JSON 数据，请检查 Base URL 和接口协议。", code="non_json") from exc
+        except asyncio.TimeoutError as exc:
+            raise ProviderRequestError("API 响应超时。生成请求可能已被服务端接收。", code="timeout") from exc
+        except aiohttp.ClientError as exc:
+            raise ProviderRequestError("API 连接中断。生成请求可能已被服务端接收。", code="connection") from exc
         if not isinstance(body, dict):
-            raise ProviderRequestError("API 响应结构无效。")
+            raise ProviderRequestError("API 响应结构无效。", code="invalid_response")
         if body.get("error"):
-            raise ProviderRequestError("API 返回错误，请检查此连接的模型、密钥和额度。")
+            raise ProviderRequestError("API 返回错误，请检查此连接的模型、密钥和额度。", code=_api_error_code(body))
         return body
 
     def _record_tokens(self, body: dict[str, Any]) -> None:
@@ -135,23 +179,39 @@ class OpenAICompatibleProvider(BaseProvider):
         if self.connection.provider == "openai" and payload["model"].startswith(("gpt-5", "o1", "o3", "o4")):
             payload["max_completion_tokens"] = payload.pop("max_tokens")
             payload.pop("temperature")
-        for attempt in range(max(1, max_attempts)):
+        return await self._generate_text_with_retries("chat/completions", payload, max_attempts, retry_delay)
+
+    async def _generate_text_with_retries(self, path: str, payload: dict[str, Any],
+                                        max_attempts: int, retry_delay: float) -> list[str]:
+        attempts = max(1, max_attempts)
+        for attempt in range(attempts):
             self.usage["text_requests"] += 1
             try:
-                body = await self._request_json("POST", "chat/completions", payload=payload)
-                break
+                body = await self._request_json("POST", path, payload=payload)
+                self._record_tokens(body)
+                return [self._text_from_response(body)]
             except ProviderRequestError as exc:
-                if exc.status not in {429, 500, 502, 503, 504} or attempt + 1 >= max_attempts:
+                if not exc.retryable or attempt + 1 >= attempts:
                     raise
                 await asyncio.sleep(min(retry_delay * 2**attempt, 30))
-        self._record_tokens(body)
+
+    def _text_from_response(self, body: dict[str, Any]) -> str:
         choices = body.get("choices") or []
-        value = choices[0].get("message", {}).get("content") if choices else None
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        if choice.get("finish_reason") == "content_filter":
+            raise ProviderRequestError("模型安全规则阻止了响应。", code="content_filter")
+        if choice.get("finish_reason") == "length":
+            raise ProviderRequestError("文本输出达到上限。", code="output_limit")
+        message = choice.get("message") or {}
+        if isinstance(message, dict) and message.get("refusal"):
+            raise ProviderRequestError("模型拒绝了响应。", code="content_filter")
+        value = message.get("content") if isinstance(message, dict) else None
         if isinstance(value, list):
-            value = "\n".join(part.get("text", "") for part in value if isinstance(part, dict) and part.get("type") in {"text", "output_text"})
+            value = "\n".join(part["text"] for part in value if isinstance(part, dict)
+                              and part.get("type") in {"text", "output_text"} and isinstance(part.get("text"), str))
         if not isinstance(value, str) or not value.strip() or value.strip() == "Error":
-            raise ProviderRequestError("文本模型没有返回有效文本。")
-        return [value]
+            raise ProviderRequestError("文本模型没有返回有效文本。", code="empty_text")
+        return value
 
     async def _download_bytes(self, url: str, max_attempts: int = 3, retry_delay: float = 1) -> bytes:
         if url.startswith("data:"):

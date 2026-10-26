@@ -44,7 +44,8 @@ class BoundSession:
 
     def usage(self) -> dict:
         values = dict(self.runtime.usage)
-        values.update(image_requests=self.image_requests, text_requests=self.text_requests,
+        values.update(image_requests=self.image_requests,
+                      text_requests=max(self.text_requests, int(values.get("text_requests", 0))),
                       max_image_calls=self.max_image_calls)
         return values
 

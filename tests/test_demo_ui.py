@@ -38,7 +38,8 @@ def test_running_job_shows_completed_candidates_and_cancel_control(monkeypatch):
         def cancel(self): self.cancelled = True
         def snapshot(self):
             return {"status": "running", "total": 6, "usage": {}, "settings": {"exp_mode": "demo_planner_critic"},
-                    "results": [{"candidate_id": 4, "status": "completed", "target_diagram_desc0_base64_png": encoded}],
+                    "results": [{"candidate_id": 4, "status": "completed", "target_diagram_desc0_base64_png": encoded,
+                                 "stylist_warning": "风格优化未完成，已使用原规划继续生成。"}],
                     "stages": {"4": "critic_3"}}
     job = RunningJob()
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "demo.py"))
@@ -46,6 +47,7 @@ def test_running_job_shows_completed_candidates_and_cancel_control(monkeypatch):
     app.run(timeout=45)
     assert not app.exception
     assert any(item.value == "**候选 5**" for item in app.markdown)
+    assert any("已使用原规划" in item.value for item in app.warning)
     cancel = next(button for button in app.button if button.label == "取消任务并保留已完成结果")
     cancel.click().run(timeout=45)
     assert job.cancelled

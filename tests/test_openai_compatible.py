@@ -20,6 +20,109 @@ def make_provider(provider="newapi", image_api="images", model="gateway-image"):
     return OpenAICompatibleProvider(ModelConnection(provider=provider, base_url="https://example.com/v1", api_key="private-key", model=model, image_api=image_api))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["timeout", "connection", "non_json", "invalid_response"])
+async def test_text_retries_transient_failures_without_changing_request(code):
+    provider = make_provider(model="text-model")
+    success = {"choices": [{"message": {"content": "complete description"}}]}
+    request = AsyncMock(side_effect=[ProviderRequestError("private upstream body", code=code), success])
+    with patch.object(provider, "_request_json", request):
+        assert await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], retry_delay=0) == ["complete description"]
+    assert request.await_count == 2
+    assert request.await_args_list[0] == request.await_args_list[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,code", [
+    (asyncio.TimeoutError("private upstream details"), "timeout"),
+    (aiohttp.ClientConnectionError("private upstream details"), "connection"),
+])
+async def test_transport_failures_are_classified_and_bounded(failure, code):
+    provider = make_provider(model="text-model")
+    session = MagicMock()
+    session.request.side_effect = failure
+    with patch.object(provider, "_get_session", AsyncMock(return_value=session)):
+        with pytest.raises(ProviderRequestError) as error:
+            await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], max_attempts=2, retry_delay=0)
+    assert error.value.code == code and session.request.call_count == 2
+    assert "private upstream details" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_http_error_payload_is_classified_without_exposing_private_body():
+    provider = make_provider(model="text-model")
+    response = MagicMock(status=400)
+    response.json = AsyncMock(return_value={"error": {"code": "context_length_exceeded", "message": "private-key and source manuscript"}})
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.request.return_value = context
+    with patch.object(provider, "_get_session", AsyncMock(return_value=session)):
+        with pytest.raises(ProviderRequestError) as error:
+            await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], retry_delay=0)
+    assert error.value.code == "input_limit" and error.value.status == 400
+    assert session.request.call_count == 1
+    assert "private-key" not in str(error.value) and "source manuscript" not in error.value.safe_hint
+
+
+@pytest.mark.asyncio
+async def test_empty_text_is_retried_and_usage_includes_failed_response():
+    provider = make_provider(model="text-model")
+    request = AsyncMock(side_effect=[
+        {"choices": [{"message": {"content": None, "reasoning_content": "private reasoning"}}], "usage": {"total_tokens": 90}},
+        {"choices": [{"message": {"content": "actual final description"}}], "usage": {"total_tokens": 10}},
+    ])
+    with patch.object(provider, "_request_json", request):
+        result = await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], retry_delay=0)
+    assert result == ["actual final description"]
+    assert request.await_count == 2 and provider.usage["total_tokens"] == 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason,code", [("length", "output_limit"), ("content_filter", "content_filter")])
+async def test_truncated_or_blocked_text_does_not_retry_identical_request(reason, code):
+    provider = make_provider(model="text-model")
+    body = {"choices": [{"finish_reason": reason, "message": {"content": "incomplete description", "reasoning_content": "private reasoning"}}]}
+    with patch.object(provider, "_request_json", AsyncMock(return_value=body)) as request:
+        with pytest.raises(ProviderRequestError) as error:
+            await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], retry_delay=0)
+    assert error.value.code == code and request.await_count == 1
+    assert "private reasoning" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_authentication_error_is_not_retried():
+    provider = make_provider(model="text-model")
+    with patch.object(provider, "_request_json", AsyncMock(side_effect=ProviderRequestError("secret body", status=401))) as request:
+        with pytest.raises(ProviderRequestError):
+            await provider.generate_text("text-model", [{"type": "text", "text": "plan"}], retry_delay=0)
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_retries_empty_response_and_never_uses_thoughts_as_description():
+    provider = GeminiProvider(ModelConnection(provider="gemini", api_key="private", model="test-model"))
+    body = {"candidates": [{"content": {"parts": [{"thought": True, "text": "private thoughts"}]}}]}
+    success = {"candidates": [{"content": {"parts": [{"text": "final description"}]}}]}
+    with patch.object(provider, "_request_json", AsyncMock(side_effect=[body, success])) as request:
+        assert await provider.generate_text("test-model", [{"type": "text", "text": "plan"}], retry_delay=0) == ["final description"]
+    assert request.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body,code", [
+    ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "output_limit"),
+    ({"promptFeedback": {"blockReason": "SAFETY"}}, "content_filter"),
+])
+async def test_gemini_output_limit_and_safety_are_classified_without_retry(body, code):
+    provider = GeminiProvider(ModelConnection(provider="gemini", api_key="private", model="test-model"))
+    with patch.object(provider, "_request_json", AsyncMock(return_value=body)) as request:
+        with pytest.raises(ProviderRequestError) as error:
+            await provider.generate_text("test-model", [{"type": "text", "text": "plan"}], retry_delay=0)
+    assert error.value.code == code and request.await_count == 1
+
+
 def test_planner_images_and_source_images_both_reach_text_messages():
     result = contents_to_messages([{"type": "text", "text": "plan"}, {"type": "image", "image_base64": IMAGE_B64},
                                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMAGE_B64}}])

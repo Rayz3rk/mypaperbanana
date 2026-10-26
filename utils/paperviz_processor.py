@@ -19,7 +19,8 @@ import hashlib
 import json
 from typing import Any, AsyncGenerator, Dict, List
 
-from .output_options import reference_root, resolve_rounds
+from providers.openai_compatible import ProviderRequestError
+from .output_options import reference_root, require_description, resolve_rounds
 
 
 class PaperVizProcessor:
@@ -47,6 +48,28 @@ class PaperVizProcessor:
         result = await agent.process(data, **kwargs)
         self._progress(result, name+"_completed")
         return result
+
+    async def _style(self, data: dict) -> dict:
+        try:
+            result = await self._stage(data, "stylist", self.stylist_agent)
+            result["stylist_status"] = "completed"
+            return result
+        except ProviderRequestError as exc:
+            # Aesthetic refinement is optional; only a valid completed plan may
+            # replace it. Authentication, configuration and safety errors stop.
+            if (exc.status in {401, 402, 403, 404} or exc.code == "content_filter"
+                    or (not exc.retryable and exc.code not in {"input_limit", "output_limit"})):
+                raise
+            task = self.exp_config.task_name.lower()
+            require_description(data.get(f"target_{task}_desc0"), "规划")
+            data.pop(f"target_{task}_stylist_desc0", None)
+            data["stylist_status"] = "fallback"
+            data["stylist_error_code"] = exc.code
+            if isinstance(exc.status, int):
+                data["stylist_http_status"] = exc.status
+            data["stylist_warning"] = f"风格优化未完成：{exc.safe_hint}。已使用原规划描述继续生成，本候选未应用风格优化。"
+            self._progress(data, "stylist_fallback")
+            return data
 
     async def _retrieve(self, data: dict) -> dict:
         setting = self.exp_config.retrieval_setting
@@ -116,7 +139,8 @@ class PaperVizProcessor:
             data = await self._stage(data, "planner", self.planner_agent)
             stylist = mode in {"dev_planner_stylist", "dev_full", "demo_full"}
             if stylist:
-                data = await self._stage(data, "stylist", self.stylist_agent)
+                data = await self._style(data)
+                stylist = data.get("stylist_status") != "fallback"
             data = await self._stage(data, "visualizer", self.visualizer_agent)
             data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg" if stylist else f"target_{task}_desc0_base64_jpg"
             if mode in {"dev_planner_critic", "demo_planner_critic", "dev_full", "demo_full"}:
@@ -153,7 +177,12 @@ class PaperVizProcessor:
                     # Never persist exception text: providers can include keys, URLs or user text.
                     data["error"] = f"{stage} 阶段失败（{type(exc).__name__}）"
                     status = getattr(exc, "status", None)
-                    if isinstance(status, int):
+                    if isinstance(exc, ProviderRequestError):
+                        data["error_code"] = exc.code
+                        data["error"] = f"{stage} 阶段失败：{exc.safe_hint}"
+                        if isinstance(status, int):
+                            data["http_status"] = status
+                    elif isinstance(status, int):
                         hints = {401: "密钥无效或未授权", 403: "该密钥没有访问权限", 404: "模型或接口路径不存在",
                                  429: "服务商限流或额度不足"}
                         data["error"] = f"{stage} 阶段失败：{hints.get(status, '服务商请求失败')}（HTTP {status}）"
